@@ -2,8 +2,8 @@
  * 服务端冒烟测试：起真实进程 + 真实 SQLite 文件，走完整同步链路。
  * 用法：node smoke/smoke.mjs（在 apps/server 目录下）
  *
- * 覆盖：auth 全流程 → 限频 → push(create) → 幂等重发 → LWW superseded
- *       → 墓碑拒绝复活 → 增量拉取游标 → op_log 历史
+ * 覆盖：账号密码登录 → 防爆破限频 → push(create) → 幂等重发 → LWW superseded
+ *       → 墓碑拒绝复活 → 增量拉取游标 → op_log 历史 → refresh 轮换
  */
 import { spawn } from "node:child_process";
 import { rmSync, mkdirSync } from "node:fs";
@@ -47,7 +47,14 @@ const nodeExe = process.execPath;
 const tsxCli = join(root, "node_modules", "tsx", "dist", "cli.mjs");
 const srv = spawn(nodeExe, [tsxCli, "src/index.ts"], {
   cwd: root,
-  env: { ...process.env, PORT: "8799", DB_PATH: DB, JWT_SECRET: "smoke-test-secret" },
+  env: {
+    ...process.env,
+    PORT: "8799",
+    DB_PATH: DB,
+    JWT_SECRET: "smoke-test-secret",
+    ADMIN_USERNAME: "Admin", // 故意混大小写，验证 NOCASE
+    ADMIN_PASSWORD: "smoke-pass-123",
+  },
   stdio: ["ignore", "pipe", "pipe"],
 });
 let serverLog = "";
@@ -68,21 +75,31 @@ try {
   ok(true, "server up / healthz");
 
   // ---- auth ----
-  const email = "Smoke@Test.com"; // 故意混大小写，验证 NOCASE
-  const r1 = await api("/api/v1/auth/code", { method: "POST", body: { email } });
-  ok(r1.status === 200 && r1.json.cooldown_sec === 60, "auth/code 发送验证码");
+  const r0 = await api("/api/v1/auth/login", {
+    method: "POST",
+    body: { username: "admin", password: "wrong-pass" },
+  });
+  ok(r0.status === 401, "login 错误密码 → 401");
 
-  const r2 = await api("/api/v1/auth/code", { method: "POST", body: { email } });
-  ok(r2.status === 429, "auth/code 1 分钟内重发被限频");
-
-  const m = serverLog.match(/验证码 → \S+: (\d{6})/);
-  if (!m) throw new Error("console mailer 未打印验证码\n" + serverLog);
-  const code = m[1];
-
-  const r3 = await api("/api/v1/auth/verify", { method: "POST", body: { email: email.toLowerCase(), code } });
-  ok(r3.status === 200 && r3.json.access_token && r3.json.refresh_token, "auth/verify 首次登录即注册（大小写不敏感）");
+  const r3 = await api("/api/v1/auth/login", {
+    method: "POST",
+    body: { username: "admin", password: "smoke-pass-123" }, // 小写登录大写账号，验证 NOCASE
+  });
+  ok(r3.status === 200 && r3.json.access_token && r3.json.refresh_token,
+     "login 初始账号成功（用户名大小写不敏感）");
   const token = r3.json.access_token;
   const refreshToken = r3.json.refresh_token;
+
+  // 防爆破：用无关账号连续失败 5 次后第 6 次被 429（不影响 admin）
+  let lastStatus = 0;
+  for (let i = 0; i < 6; i++) {
+    const r = await api("/api/v1/auth/login", {
+      method: "POST",
+      body: { username: "nobody", password: "x" },
+    });
+    lastStatus = r.status;
+  }
+  ok(lastStatus === 429, "连续 5 次失败后触发 429 限频");
 
   const r4 = await api("/api/v1/tasks", { token: "bad-token" });
   ok(r4.status === 401, "无 token 访问 tasks 被 401");

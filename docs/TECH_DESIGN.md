@@ -154,14 +154,15 @@ Base URL：`https://api.<domain>/api/v1`。除 auth 外全部需要 `Authorizati
 
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
-| POST | /auth/code | `{email}` | `{cooldown_sec: 60}` |
-| POST | /auth/verify | `{email, code}` | `{access_token, refresh_token, expires_in, user: {id, email}}` |
+| POST | /auth/login | `{username, password}` | `{access_token, refresh_token, expires_in, user: {id, username}}` |
 | POST | /auth/refresh | `{refresh_token}` | 同上，refresh_token 轮换（旧的一次性失效） |
 | POST | /auth/logout | `{refresh_token}` | 204 |
 
-- access_token：JWT，2 小时有效，claims = `{sub: user_id}`
+- 账号体系：单用户模式，初始账号 admin（`ADMIN_USERNAME`/`ADMIN_PASSWORD` 环境变量可覆盖），首次启动自动 seed
+- 密码存储：scrypt（Node 内置 crypto），salt:hash 格式
+- access_token：JWT，2 小时有效，claims = `{sub: user_id}`；客户端 localStorage 持久化，401 自动 refresh 重试
 - refresh_token：随机 256-bit，30 天有效，轮换制
-- 验证码：6 位数字，10 分钟有效，错误 5 次作废，发送限频 1 次/分钟、5 次/天/邮箱
+- 防爆破：同用户名 1 分钟内最多 5 次失败，超限 429（内存计数，重启清零）
 
 ### 4.2 任务同步
 

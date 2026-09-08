@@ -2,24 +2,17 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { env } from "./env.js";
+import { hashPassword } from "./password.js";
 
 // schema 内嵌于此（single source of truth，对应 docs/TECH_DESIGN.md §3.1）
 // 约定：时间戳一律 INTEGER 毫秒 epoch；布尔存 INTEGER 0/1；JSON 存 TEXT；
-// email 用 COLLATE NOCASE 实现大小写不敏感（等价原 PG 的 CITEXT）
+// username 用 COLLATE NOCASE 实现大小写不敏感
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id            TEXT PRIMARY KEY,
-  email         TEXT UNIQUE NOT NULL COLLATE NOCASE,
+  username      TEXT UNIQUE NOT NULL COLLATE NOCASE,
+  password_hash TEXT NOT NULL,
   created_at    INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS auth_codes (
-  email         TEXT NOT NULL COLLATE NOCASE,
-  code          TEXT NOT NULL,
-  expires_at    INTEGER NOT NULL,
-  attempts      INTEGER NOT NULL DEFAULT 0,
-  created_at    INTEGER NOT NULL,
-  PRIMARY KEY (email, code)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -31,8 +24,6 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at    INTEGER NOT NULL
 );
 
--- 注意：seq 为同步游标，必须"每次变更都推进"，故不用自增列（ON CONFLICT DO UPDATE
--- 时自增列不变），由写入语句显式分配 MAX(seq)+1（事务内串行，无并发竞争）
 CREATE TABLE IF NOT EXISTS tasks (
   id                TEXT PRIMARY KEY,
   seq               INTEGER NOT NULL UNIQUE,
@@ -77,3 +68,14 @@ db.pragma("foreign_keys = ON"); // SQLite 默认关外键，必须显式打开
 db.pragma("busy_timeout = 5000");
 db.pragma("synchronous = NORMAL");
 db.exec(SCHEMA);
+
+// 初始账号：不存在则创建（用户名/密码可用环境变量覆盖）
+const adminExists = db
+  .prepare(`SELECT id FROM users WHERE username = ?`)
+  .get(env.adminUsername);
+if (!adminExists) {
+  db.prepare(
+    `INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)`,
+  ).run(crypto.randomUUID(), env.adminUsername, hashPassword(env.adminPassword), Date.now());
+  console.log(`[seed] 初始账号已创建：${env.adminUsername}`);
+}

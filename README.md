@@ -8,7 +8,7 @@
 ## 架构
 
 ```
-                 apps/server (Hono + PostgreSQL)
+                 apps/server (Hono + SQLite 内嵌，单进程)
                 ┌──────────────┴──────────────┐
           HTTPS/WS                       HTTPS/WS
         packages/web                  apps/android (规划中)
@@ -19,13 +19,16 @@
 packages/sync-core：平台无关同步引擎（outbox + 游标增量 + LWW + 幂等）
 ```
 
+> 存储引擎：2026-09 从 PostgreSQL 迁至 SQLite 内嵌（面向小内存服务器，省 200–400MB）。
+> PG 版完整保留在 `postgres` 分支。
+
 ## 目录
 
 | 路径 | 说明 |
 |---|---|
 | `packages/web` | 网页端 PWA（Svelte 5 + Vite + Dexie），同时是桌面端 UI 源 |
 | `packages/sync-core` | 同步引擎 + 内存参考实现 + 双端收敛单测（vitest） |
-| `apps/server` | 后端：邮箱验证码认证、增量拉取、批量幂等推送、op_log、WS 通知 |
+| `apps/server` | 后端：账号密码认证、增量拉取、批量幂等推送、op_log、WS 通知 |
 | `apps/desktop` | Windows 桌面端（Tauri 2），贴边弹出状态机 + 托盘 |
 
 ## 快速开始
@@ -36,12 +39,11 @@ pnpm install
 # 网页端（纯本地即可用，IndexedDB 存储）
 pnpm --filter @edgetodo/web dev        # http://localhost:5173
 
-# 后端（需要 Docker）
+# 后端（SQLite 内嵌，无需 Docker / 独立数据库进程）
 cd apps/server
 cp .env.example .env                   # 改 JWT_SECRET
-docker compose up -d postgres          # 首次启动自动执行 schema.sql
-pnpm --filter @edgetodo/server dev     # http://localhost:8787
-# 开发模式验证码直接打印在 server 控制台
+pnpm --filter @edgetodo/server dev     # http://localhost:8787，库文件自动创建于 ./data/
+# 首次启动自动 seed 初始账号 admin / ll123456（ADMIN_USERNAME/ADMIN_PASSWORD 环境变量可覆盖）
 
 # Web 端接入同步：packages/web/.env 写入
 # VITE_API_URL=http://localhost:8787 然后刷新页面登录
@@ -56,7 +58,7 @@ pnpm --filter @edgetodo/desktop dev
 pnpm --filter @edgetodo/sync-core test      # 同步协议单测（并发冲突/幂等/墓碑/断网恢复）
 pnpm --filter @edgetodo/server typecheck
 node apps/server/smoke/smoke.mjs            # 服务端冒烟：真实 SQLite 走 auth+push+pull 全链路
-pnpm --filter @edgetodo/web build
+pnpm --filter @edgetodo/web check           # svelte-check（vite build 不做类型检查，勿替代）
 ```
 
 ## 部署

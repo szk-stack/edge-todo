@@ -45,9 +45,10 @@ export function midpoint(before?: number, after?: number): number {
 export async function addTask(title: string): Promise<void> {
   const trimmed = title.trim();
   if (!trimmed) return;
+  // orderBy 只能在 Table 上调（走索引），filter 后只能 sortBy；先索引序再 filter 取首个
   const first = await db.tasks
-    .filter((t) => t.deletedAt == null && !t.done)
     .orderBy("sortOrder")
+    .filter((t) => t.deletedAt == null && !t.done)
     .first();
   const now = Date.now();
   await writeLocal(

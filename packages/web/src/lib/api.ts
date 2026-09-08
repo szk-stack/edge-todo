@@ -29,22 +29,17 @@ function saveTokens(t: TokenBundle): void {
   localStorage.setItem(REFRESH_KEY, t.refresh_token);
 }
 
-export async function requestCode(email: string): Promise<void> {
-  const resp = await fetch(`${BASE}/api/v1/auth/code`, {
+export async function login(username: string, password: string): Promise<void> {
+  const resp = await fetch(`${BASE}/api/v1/auth/login`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ email }),
+    body: JSON.stringify({ username, password }),
   });
-  if (!resp.ok) throw new Error(`发送验证码失败：${resp.status}`);
-}
-
-export async function verifyCode(email: string, code: string): Promise<void> {
-  const resp = await fetch(`${BASE}/api/v1/auth/verify`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ email, code }),
-  });
-  if (!resp.ok) throw new Error(`验证码错误或已过期：${resp.status}`);
+  if (!resp.ok) {
+    if (resp.status === 401) throw new Error("用户名或密码错误");
+    if (resp.status === 429) throw new Error("尝试次数过多，请 1 分钟后再试");
+    throw new Error(`登录失败：${resp.status}`);
+  }
   saveTokens(await resp.json());
 }
 

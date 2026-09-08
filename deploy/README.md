@@ -33,7 +33,7 @@ sudo cp -r apps/server/dist apps/server/node_modules /opt/edgetodo/server/
 
 # 3. 配置
 sudo cp apps/server/.env.example /opt/edgetodo/server/.env
-sudoedit /opt/edgetodo/server/.env   # 必须改 JWT_SECRET（openssl rand -hex 32）
+sudoedit /opt/edgetodo/server/.env   # 必须改 JWT_SECRET（openssl rand -hex 32）和 ADMIN_PASSWORD
 sudo chown -R edgetodo:edgetodo /opt/edgetodo/server
 
 # 4. systemd
