@@ -55,8 +55,14 @@ pnpm --filter @edgetodo/desktop dev
 ```bash
 pnpm --filter @edgetodo/sync-core test      # 同步协议单测（并发冲突/幂等/墓碑/断网恢复）
 pnpm --filter @edgetodo/server typecheck
+node apps/server/smoke/smoke.mjs            # 服务端冒烟：真实 SQLite 走 auth+push+pull 全链路
 pnpm --filter @edgetodo/web build
 ```
+
+## 部署
+
+裸机单进程方案（systemd + nginx + SQLite 文件备份），见 `deploy/README.md`。
+预期内存占用 < 100MB，适合小内存服务器。
 
 ## 同步协议要点
 

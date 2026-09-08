@@ -3,12 +3,24 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import { createNodeWebSocket } from "@hono/node-ws";
 import { env } from "./env.js";
+import { db } from "./db.js";
 import { verifyAccessToken } from "./jwt.js";
 import { authRoutes } from "./routes/auth.js";
 import { taskRoutes } from "./routes/tasks.js";
 import { registerWs, unregisterWs } from "./ws.js";
 
 const app = new Hono();
+
+// 定期清理：processed_changes 保留 7 天，op_log 保留 90 天
+setInterval(() => {
+  try {
+    const now = Date.now();
+    db.prepare(`DELETE FROM processed_changes WHERE created_at < ?`).run(now - 7 * 86_400_000);
+    db.prepare(`DELETE FROM op_log WHERE created_at < ?`).run(now - 90 * 86_400_000);
+  } catch (err) {
+    console.error("cleanup failed:", err);
+  }
+}, 86_400_000).unref();
 
 app.use("*", cors());
 app.get("/healthz", (c) => c.json({ ok: true }));

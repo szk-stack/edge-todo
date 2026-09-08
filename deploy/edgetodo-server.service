@@ -1,0 +1,23 @@
+[Unit]
+Description=Edge Todo sync server
+After=network.target
+
+[Service]
+Type=simple
+# 建议创建专用用户：useradd -r -s /usr/sbin/nologin edgetodo
+User=edgetodo
+WorkingDirectory=/opt/edgetodo/server
+Environment=NODE_ENV=production
+Environment=PORT=8787
+Environment=DB_PATH=/var/lib/edgetodo/edgetodo.db
+# .env 里放 JWT_SECRET=...（不要提交到 git）
+EnvironmentFile=/opt/edgetodo/server/.env
+# Node 路径按实际安装位置调整（which node）
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=3
+# 内存上限保护：正常应稳定在 100MB 以内，超限自动重启
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,34 +1,35 @@
 import { Hono } from "hono";
 import type { Context, Next } from "hono";
 import { z } from "zod";
-import { sql } from "../db.js";
+import { db } from "../db.js";
 import { verifyAccessToken } from "../jwt.js";
 import { notifyUser } from "../ws.js";
 
 // ---------- 类型与序列化 ----------
+// SQLite 行：时间戳为毫秒 INTEGER，done 为 0/1
 
 interface TaskRow {
   id: string;
   user_id: string;
   title: string;
-  done: boolean;
-  done_at: Date | null;
+  done: number;
+  done_at: number | null;
   sort_order: number;
-  client_updated_at: Date;
-  deleted_at: Date | null;
-  seq: string | number;
+  client_updated_at: number;
+  deleted_at: number | null;
+  seq: number;
 }
 
 function toServerTask(row: TaskRow) {
   return {
     id: row.id,
     title: row.title,
-    done: row.done,
-    doneAt: row.done_at ? row.done_at.getTime() : null,
+    done: row.done !== 0,
+    doneAt: row.done_at,
     sortOrder: row.sort_order,
-    updatedAt: row.client_updated_at.getTime(),
-    deletedAt: row.deleted_at ? row.deleted_at.getTime() : null,
-    seq: Number(row.seq),
+    updatedAt: row.client_updated_at,
+    deletedAt: row.deleted_at,
+    seq: row.seq,
   };
 }
 
@@ -54,6 +55,8 @@ const pushSchema = z.object({
   changes: z.array(changeSchema).min(1).max(100),
 });
 
+type ChangeInput = z.infer<typeof changeSchema>;
+
 // ---------- 鉴权中间件 ----------
 
 type AppEnv = { Variables: { userId: string } };
@@ -66,6 +69,43 @@ async function authed(c: Context<AppEnv>, next: Next) {
   c.set("userId", userId);
   await next();
 }
+
+// ---------- 预编译语句 ----------
+
+const stmtPull = db.prepare(
+  `SELECT * FROM tasks WHERE user_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
+);
+const stmtSeenChange = db.prepare(
+  `SELECT result FROM processed_changes WHERE user_id = ? AND change_id = ?`,
+);
+const stmtGetTask = db.prepare(`SELECT * FROM tasks WHERE user_id = ? AND id = ?`);
+const stmtUpsertTask = db.prepare(
+  // seq 显式分配 MAX+1：INSERT 与 UPDATE 两种路径都推进游标，增量拉取才能看到更新
+  `INSERT INTO tasks (seq, id, user_id, title, done, done_at, sort_order, client_updated_at, deleted_at)
+   VALUES ((SELECT COALESCE(MAX(seq), 0) + 1 FROM tasks), ?, ?, ?, ?, ?, ?, ?, ?)
+   ON CONFLICT (id) DO UPDATE SET
+     title = EXCLUDED.title,
+     done = EXCLUDED.done,
+     done_at = EXCLUDED.done_at,
+     sort_order = EXCLUDED.sort_order,
+     client_updated_at = EXCLUDED.client_updated_at,
+     deleted_at = EXCLUDED.deleted_at,
+     seq = EXCLUDED.seq
+   RETURNING *`,
+);
+const stmtInsertOp = db.prepare(
+  `INSERT INTO op_log (user_id, task_id, change_id, op, payload, created_at)
+   VALUES (?, ?, ?, ?, ?, ?)`,
+);
+const stmtMarkProcessed = db.prepare(
+  `INSERT INTO processed_changes (change_id, user_id, result, created_at)
+   VALUES (?, ?, ?, ?)
+   ON CONFLICT DO NOTHING`,
+);
+const stmtHistory = db.prepare(
+  `SELECT seq, op, payload, created_at FROM op_log
+   WHERE user_id = ? AND task_id = ? ORDER BY seq DESC LIMIT ?`,
+);
 
 // ---------- 路由 ----------
 
@@ -82,16 +122,11 @@ export const taskRoutes = new Hono<AppEnv>()
     const since = Number(c.req.query("since") ?? 0);
     const limit = Math.min(Math.max(Number(c.req.query("limit") ?? 500), 1), 1000);
 
-    const rows = (await sql`
-      SELECT * FROM tasks
-      WHERE user_id = ${userId} AND seq > ${since}
-      ORDER BY seq ASC
-      LIMIT ${limit + 1}
-    `) as TaskRow[];
+    const rows = stmtPull.all(userId, since, limit + 1) as TaskRow[];
 
     const hasMore = rows.length > limit;
     const page = hasMore ? rows.slice(0, limit) : rows;
-    const cursor = page.length > 0 ? Number(page[page.length - 1].seq) : since;
+    const cursor = page.length > 0 ? page[page.length - 1].seq : since;
     return c.json({ tasks: page.map(toServerTask), cursor, hasMore });
   })
 
@@ -104,78 +139,63 @@ export const taskRoutes = new Hono<AppEnv>()
     const results: ChangeResultJson[] = [];
     let maxSeq = 0;
 
-    await sql.begin(async (tx) => {
-      for (const ch of parsed.data.changes) {
+    // BEGIN IMMEDIATE 直接拿写锁；better-sqlite3 同步执行，事务内裁决逻辑与 PG 版逐行等价
+    const applyAll = db.transaction((changes: ChangeInput[]) => {
+      for (const ch of changes) {
         // 幂等：changeId 已处理过则直接回放结果
-        const seen = await tx`
-          SELECT result FROM processed_changes
-          WHERE user_id = ${userId} AND change_id = ${ch.changeId}
-        `;
-        if (seen.length > 0) {
-          results.push(seen[0].result as ChangeResultJson);
+        const seen = stmtSeenChange.get(userId, ch.changeId) as
+          | { result: string }
+          | undefined;
+        if (seen) {
+          results.push(JSON.parse(seen.result) as ChangeResultJson);
           continue;
         }
 
-        const existingRows = (await tx`
-          SELECT * FROM tasks
-          WHERE user_id = ${userId} AND id = ${ch.task.id}
-          FOR UPDATE
-        `) as TaskRow[];
-        const existing = existingRows[0];
+        const existing = stmtGetTask.get(userId, ch.task.id) as TaskRow | undefined;
 
         let result: ChangeResultJson;
-        if (existing?.deleted_at != null) {
+        if (existing && existing.deleted_at != null) {
           // 墓碑优先：拒绝复活
           result = { changeId: ch.changeId, status: "superseded", serverTask: toServerTask(existing) };
         } else if (
           !existing ||
           ch.op === "delete" ||
-          new Date(ch.task.updatedAt).getTime() >= existing.client_updated_at.getTime()
+          ch.task.updatedAt >= existing.client_updated_at
         ) {
           const deletedAt =
-            ch.op === "delete"
-              ? new Date(ch.task.deletedAt ?? Date.now())
-              : ch.task.deletedAt != null
-                ? new Date(ch.task.deletedAt)
-                : null;
-          const applied = (await tx`
-            INSERT INTO tasks (id, user_id, title, done, done_at, sort_order, client_updated_at, deleted_at)
-            VALUES (
-              ${ch.task.id}, ${userId}, ${ch.task.title}, ${ch.task.done},
-              ${ch.task.doneAt != null ? new Date(ch.task.doneAt) : null},
-              ${ch.task.sortOrder}, ${new Date(ch.task.updatedAt)}, ${deletedAt}
-            )
-            ON CONFLICT (id) DO UPDATE SET
-              title = EXCLUDED.title,
-              done = EXCLUDED.done,
-              done_at = EXCLUDED.done_at,
-              sort_order = EXCLUDED.sort_order,
-              client_updated_at = EXCLUDED.client_updated_at,
-              deleted_at = EXCLUDED.deleted_at
-            RETURNING *
-          `) as TaskRow[];
-          const row = applied[0];
-          maxSeq = Math.max(maxSeq, Number(row.seq));
+            ch.op === "delete" ? (ch.task.deletedAt ?? Date.now()) : ch.task.deletedAt;
+          const row = stmtUpsertTask.get(
+            ch.task.id,
+            userId,
+            ch.task.title,
+            ch.task.done ? 1 : 0,
+            ch.task.doneAt,
+            ch.task.sortOrder,
+            ch.task.updatedAt,
+            deletedAt,
+          ) as TaskRow;
+          maxSeq = Math.max(maxSeq, row.seq);
 
           // op_log：同事务追加变更快照
-          await tx`
-            INSERT INTO op_log (user_id, task_id, change_id, op, payload)
-            VALUES (${userId}, ${ch.task.id}, ${ch.changeId}, ${ch.op}, ${tx.json(toServerTask(row))})
-          `;
+          stmtInsertOp.run(
+            userId,
+            ch.task.id,
+            ch.changeId,
+            ch.op,
+            JSON.stringify(toServerTask(row)),
+            Date.now(),
+          );
           result = { changeId: ch.changeId, status: "applied" };
         } else {
           // LWW 判负：回传服务端权威版本
           result = { changeId: ch.changeId, status: "superseded", serverTask: toServerTask(existing) };
         }
 
-        await tx`
-          INSERT INTO processed_changes (change_id, user_id, result)
-          VALUES (${ch.changeId}, ${userId}, ${tx.json(result)})
-          ON CONFLICT DO NOTHING
-        `;
+        stmtMarkProcessed.run(ch.changeId, userId, JSON.stringify(result), Date.now());
         results.push(result);
       }
     });
+    applyAll.immediate(parsed.data.changes);
 
     // 事务提交后广播变更信号
     if (maxSeq > 0) notifyUser(userId, maxSeq);
@@ -187,10 +207,18 @@ export const taskRoutes = new Hono<AppEnv>()
     const userId = c.get("userId");
     const taskId = c.req.param("id");
     const limit = Math.min(Math.max(Number(c.req.query("limit") ?? 50), 1), 200);
-    const rows = await sql`
-      SELECT seq, op, payload, created_at FROM op_log
-      WHERE user_id = ${userId} AND task_id = ${taskId}
-      ORDER BY seq DESC LIMIT ${limit}
-    `;
-    return c.json({ entries: rows });
+    const rows = stmtHistory.all(userId, taskId, limit) as {
+      seq: number;
+      op: string;
+      payload: string;
+      created_at: number;
+    }[];
+    return c.json({
+      entries: rows.map((r) => ({
+        seq: r.seq,
+        op: r.op,
+        payload: JSON.parse(r.payload),
+        createdAt: r.created_at,
+      })),
+    });
   });

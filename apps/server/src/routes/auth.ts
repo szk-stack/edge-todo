@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { z } from "zod";
-import { sql } from "../db.js";
+import { db } from "../db.js";
 import { mailer } from "../mailer.js";
 import { signAccessToken } from "../jwt.js";
 
@@ -11,19 +11,54 @@ const verifySchema = z.object({
 });
 const refreshSchema = z.object({ refresh_token: z.string().min(32) });
 
-const CODE_TTL_MIN = 10;
-const SESSION_TTL_DAYS = 30;
+const CODE_TTL_MS = 10 * 60_000; // 验证码 10 分钟有效
+const RATE_LIMIT_MS = 60_000; // 限频：1 分钟内只允许发一次
+const SESSION_TTL_MS = 30 * 86_400_000; // 会话 30 天
 
 function genCode(): string {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+// ---------- 预编译语句 ----------
+
+const stmtRecentCode = db.prepare(
+  `SELECT 1 FROM auth_codes WHERE email = ? AND created_at > ? LIMIT 1`,
+);
+const stmtInsertCode = db.prepare(
+  `INSERT INTO auth_codes (email, code, expires_at, created_at) VALUES (?, ?, ?, ?)`,
+);
+const stmtFindCode = db.prepare(
+  `SELECT * FROM auth_codes WHERE email = ? AND code = ? AND expires_at > ?
+   ORDER BY created_at DESC LIMIT 1`,
+);
+const stmtDeleteCodes = db.prepare(`DELETE FROM auth_codes WHERE email = ?`);
+const stmtUpsertUser = db.prepare(
+  `INSERT INTO users (id, email, created_at) VALUES (?, ?, ?)
+   ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+   RETURNING id`,
+);
+const stmtInsertSession = db.prepare(
+  `INSERT INTO sessions (id, user_id, refresh_token, device_name, created_at, expires_at)
+   VALUES (?, ?, ?, ?, ?, ?)`,
+);
+const stmtFindSession = db.prepare(
+  `SELECT user_id FROM sessions WHERE refresh_token = ? AND expires_at > ?`,
+);
+const stmtDeleteSession = db.prepare(`DELETE FROM sessions WHERE refresh_token = ?`);
+
+// ---------- 路由 ----------
+
 async function issueTokens(userId: string, deviceName?: string) {
   const refreshToken = crypto.randomUUID() + crypto.randomUUID();
-  await sql`
-    INSERT INTO sessions (user_id, refresh_token, device_name, expires_at)
-    VALUES (${userId}, ${refreshToken}, ${deviceName ?? null}, now() + interval '${SESSION_TTL_DAYS} days')
-  `;
+  const now = Date.now();
+  stmtInsertSession.run(
+    crypto.randomUUID(),
+    userId,
+    refreshToken,
+    deviceName ?? null,
+    now,
+    now + SESSION_TTL_MS,
+  );
   return {
     access_token: await signAccessToken(userId),
     refresh_token: refreshToken,
@@ -37,19 +72,13 @@ export const authRoutes = new Hono()
     if (!parsed.success) return c.json({ error: "invalid email" }, 400);
     const { email } = parsed.data;
 
-    // 限频：1 分钟内只允许发一次
-    const recent = await sql`
-      SELECT 1 FROM auth_codes
-      WHERE email = ${email} AND created_at > now() - interval '1 minute'
-      LIMIT 1
-    `;
-    if (recent.length > 0) return c.json({ error: "too frequent", cooldown_sec: 60 }, 429);
+    const now = Date.now();
+    if (stmtRecentCode.get(email, now - RATE_LIMIT_MS)) {
+      return c.json({ error: "too frequent", cooldown_sec: 60 }, 429);
+    }
 
     const code = genCode();
-    await sql`
-      INSERT INTO auth_codes (email, code, expires_at)
-      VALUES (${email}, ${code}, now() + interval '${CODE_TTL_MIN} minutes')
-    `;
+    stmtInsertCode.run(email, code, now + CODE_TTL_MS, now);
     await mailer.sendCode(email, code);
     return c.json({ cooldown_sec: 60 });
   })
@@ -59,27 +88,19 @@ export const authRoutes = new Hono()
     if (!parsed.success) return c.json({ error: "invalid request" }, 400);
     const { email, code } = parsed.data;
 
-    const rows = await sql`
-      SELECT * FROM auth_codes
-      WHERE email = ${email} AND code = ${code} AND expires_at > now()
-      ORDER BY created_at DESC LIMIT 1
-    `;
-    const record = rows[0];
+    const record = stmtFindCode.get(email, code, Date.now()) as
+      | { email: string; code: string; attempts: number }
+      | undefined;
     if (!record || record.attempts >= 5) {
       return c.json({ error: "code invalid or expired" }, 401);
     }
 
-    // 首次登录即注册
-    const users = await sql`
-      INSERT INTO users (email) VALUES (${email})
-      ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-      RETURNING id
-    `;
-    const userId = users[0].id as string;
-    await sql`DELETE FROM auth_codes WHERE email = ${email}`;
+    // 首次登录即注册（email 列 COLLATE NOCASE，大小写不敏感）
+    const user = stmtUpsertUser.get(crypto.randomUUID(), email, Date.now()) as { id: string };
+    stmtDeleteCodes.run(email);
 
-    const tokens = await issueTokens(userId);
-    return c.json({ ...tokens, user: { id: userId, email } });
+    const tokens = await issueTokens(user.id);
+    return c.json({ ...tokens, user: { id: user.id, email } });
   })
 
   .post("/refresh", async (c) => {
@@ -87,23 +108,21 @@ export const authRoutes = new Hono()
     if (!parsed.success) return c.json({ error: "invalid request" }, 400);
     const { refresh_token } = parsed.data;
 
-    const rows = await sql`
-      SELECT user_id FROM sessions
-      WHERE refresh_token = ${refresh_token} AND expires_at > now()
-    `;
-    if (rows.length === 0) return c.json({ error: "session expired" }, 401);
-    const userId = rows[0].user_id as string;
+    const session = stmtFindSession.get(refresh_token, Date.now()) as
+      | { user_id: string }
+      | undefined;
+    if (!session) return c.json({ error: "session expired" }, 401);
 
     // 轮换：旧 refresh token 一次性失效
-    await sql`DELETE FROM sessions WHERE refresh_token = ${refresh_token}`;
-    const tokens = await issueTokens(userId);
+    stmtDeleteSession.run(refresh_token);
+    const tokens = await issueTokens(session.user_id);
     return c.json(tokens);
   })
 
   .post("/logout", async (c) => {
     const parsed = refreshSchema.safeParse(await c.req.json().catch(() => null));
     if (parsed.success) {
-      await sql`DELETE FROM sessions WHERE refresh_token = ${parsed.data.refresh_token}`;
+      stmtDeleteSession.run(parsed.data.refresh_token);
     }
     return c.body(null, 204);
   });

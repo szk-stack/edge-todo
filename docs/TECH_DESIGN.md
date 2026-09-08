@@ -10,8 +10,8 @@
 
 ```
 ┌────────────────────────────────────────────────┐
-│              云端（单 VPS / docker-compose）      │
-│  Hono API (REST+WS) ── PostgreSQL ── Caddy      │
+│         云端（单 VPS，裸机单进程，无 Docker）       │
+│  Hono API (REST+WS) ── SQLite 内嵌 ── nginx      │
 └───────┬──────────────┬──────────────┬──────────┘
         │ HTTPS/WS     │ HTTPS/WS     │ HTTPS/WS
 ┌───────▼─────┐ ┌──────▼──────┐ ┌─────▼───────────┐
@@ -47,67 +47,75 @@
 
 ## 3. 数据模型
 
-### 3.1 服务端（PostgreSQL）
+### 3.1 服务端（SQLite 内嵌，schema 以 `apps/server/src/db.ts` 内嵌定义为准）
+
+约定：时间戳一律 `INTEGER` 毫秒 epoch；布尔存 `INTEGER` 0/1；JSON 存 `TEXT`；
+email 用 `COLLATE NOCASE` 实现大小写不敏感。
 
 ```sql
 CREATE TABLE users (
-  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  email         CITEXT UNIQUE NOT NULL,
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  id            TEXT PRIMARY KEY,        -- 应用层生成 UUID
+  email         TEXT UNIQUE NOT NULL COLLATE NOCASE,
+  created_at    INTEGER NOT NULL
 );
 
 -- 邮箱验证码
 CREATE TABLE auth_codes (
-  email         CITEXT NOT NULL,
-  code          CHAR(6) NOT NULL,
-  expires_at    TIMESTAMPTZ NOT NULL,
-  attempts      SMALLINT NOT NULL DEFAULT 0,
+  email         TEXT NOT NULL COLLATE NOCASE,
+  code          TEXT NOT NULL,
+  expires_at    INTEGER NOT NULL,
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL,
   PRIMARY KEY (email, code)
 );
 
 CREATE TABLE tasks (
-  id                UUID PRIMARY KEY,            -- 客户端生成
-  user_id           UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  title             TEXT NOT NULL CHECK (char_length(title) <= 500),
-  done              BOOLEAN NOT NULL DEFAULT false,
-  done_at           TIMESTAMPTZ,
-  sort_order        DOUBLE PRECISION NOT NULL,   -- 分数索引，拖拽取中值
-  client_updated_at TIMESTAMPTZ NOT NULL,        -- LWW 判定依据
-  deleted_at        TIMESTAMPTZ,                 -- 软删除墓碑
-  seq               BIGSERIAL,                   -- 同步游标（服务端权威）
-  UNIQUE (user_id, id)
+  id                TEXT PRIMARY KEY,             -- 客户端生成 UUID
+  seq               INTEGER NOT NULL UNIQUE,      -- 同步游标（服务端权威，手动分配 MAX+1）
+  user_id           TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title             TEXT NOT NULL CHECK (length(title) <= 500),
+  done              INTEGER NOT NULL DEFAULT 0,
+  done_at           INTEGER,
+  sort_order        REAL NOT NULL,                -- 分数索引，拖拽取中值
+  client_updated_at INTEGER NOT NULL,             -- LWW 判定依据
+  deleted_at        INTEGER                       -- 软删除墓碑
 );
 CREATE INDEX idx_tasks_user_seq ON tasks(user_id, seq);
 CREATE INDEX idx_tasks_user_active ON tasks(user_id) WHERE deleted_at IS NULL;
 
 -- 设备/会话
 CREATE TABLE sessions (
-  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id            TEXT PRIMARY KEY,
+  user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   refresh_token TEXT NOT NULL UNIQUE,
   device_name   TEXT,
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  expires_at    TIMESTAMPTZ NOT NULL
+  created_at    INTEGER NOT NULL,
+  expires_at    INTEGER NOT NULL
 );
 
 -- 变更日志（append-only，借鉴 Git 提交历史；不参与同步裁决）
 CREATE TABLE op_log (
-  seq         BIGSERIAL PRIMARY KEY,
-  user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  task_id     UUID NOT NULL,
-  change_id   UUID NOT NULL,          -- 对应客户端幂等键
+  seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  task_id     TEXT NOT NULL,
+  change_id   TEXT NOT NULL,          -- 对应客户端幂等键
   op          TEXT NOT NULL,          -- create | update | delete
-  payload     JSONB NOT NULL,         -- 变更后完整快照
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  payload     TEXT NOT NULL,          -- JSON 字符串，变更后完整快照
+  created_at  INTEGER NOT NULL
 );
 CREATE INDEX idx_oplog_task ON op_log(user_id, task_id, seq);
 ```
 
 **设计要点**：
-- `seq BIGSERIAL` 作为同步游标，不用时间戳 —— 客户端时钟不可信，`seq` 严格单调
-- `sort_order DOUBLE PRECISION`：拖拽排序时取相邻两项的中值（如 1.0 与 2.0 之间插入 1.5），避免全表重排；精度耗尽（连续 ~50 次中值切分）后后台批量重排归一化
+- `seq` 作为同步游标，不用时间戳 —— 客户端时钟不可信，`seq` 严格单调
+- **`seq` 不用自增列，由写入语句显式分配 `(SELECT COALESCE(MAX(seq),0)+1 FROM tasks)`**：
+  自增列（PG BIGSERIAL / SQLite AUTOINCREMENT  alike）在 `ON CONFLICT DO UPDATE` 的 UPDATE 分支不会推进，
+  会导致更新/删除的行游标不变、增量拉取永远漏掉这条变更。此坑由真实库冒烟测试抓出（内存 FakeServer 测不出来）。
+  事务内串行分配，无并发竞争；`MAX(seq)` 走唯一索引尾部，开销 O(log n)
+- `sort_order REAL`：拖拽排序时取相邻两项的中值（如 1.0 与 2.0 之间插入 1.5），避免全表重排；精度耗尽（连续 ~50 次中值切分）后后台批量重排归一化
 - 墓碑保留 30 天，定时任务物理清除
-- `op_log` 仅追加不修改，随每次 applied 变更同事务写入。用途：任务历史、跨设备撤销（按快照回滚后作为一条新 update 推送）、问题审计回放。**它不替代 LWW 裁决，同步协议主干不变**；保留 90 天后归档清除
+- `op_log` 仅追加不修改，随每次 applied 变更同事务写入。用途：任务历史、跨设备撤销（按快照回滚后作为一条新 update 推送）、问题审计回放。**它不替代 LWW 裁决，同步协议主干不变**；保留 90 天后由服务内定时任务清除
+- SQLite 需显式 `PRAGMA foreign_keys = ON`（默认关闭），否则 `ON DELETE CASCADE` 静默失效
 
 ### 3.2 客户端（Web Dexie / 桌面 SQLite / 安卓 Room，结构一致）
 
@@ -310,23 +318,27 @@ src/
 ├─ services/
 │  ├─ sync.ts       # LWW 裁决、seq 分配、幂等去重
 │  └─ mailer.ts     # 验证码邮件（腾讯 SES / Resend，可插拔）
-└─ db.ts            # postgres.js，迁移用 drizzle-kit 或原生 SQL 文件
+└─ db.ts            # better-sqlite3（WAL + 外键 PRAGMA），schema 内嵌，启动时自动应用
 ```
 
 - 单进程即可支撑 MVP 量级；`seq` 分配与变更广播在同一事务提交后触发
+- better-sqlite3 为同步 API：本场景查询全是索引小结果集（亚毫秒），事件循环阻塞可忽略；
+  批量推送用 `db.transaction(fn).immediate()`（BEGIN IMMEDIATE 直接拿写锁）
 - 全局限流：100 req/min/IP；同步接口按 user 限流 30 req/min
 
 ## 7. 部署
 
-```yaml
-# docker-compose.yml 概要
-services:
-  app:       # Hono，Node 22-alpine，环境变量注入
-  postgres:  # 16-alpine，卷挂载，每日 pg_dump 定时备份
-  caddy:     # 反代 + 自动 HTTPS + WebSocket 透传
+裸机单进程，无 Docker（面向小内存服务器；Docker/PG 方案见 `postgres` 分支）：
+
+```
+nginx（TLS 终止 + WS 反代）→ 127.0.0.1:8787（node，systemd 托管）→ SQLite 文件
 ```
 
-- 备份：`pg_dump` 每日打包保留 14 天
+- systemd unit：`deploy/edgetodo-server.service`（MemoryMax=256M 保护）
+- nginx 站点示例：`deploy/nginx.conf.example`（含 WS 升级头与长连接超时）
+- 备份：cron 每日 `sqlite3 .backup`（在线备份 API，WAL 下不停服）+ gzip，保留 14 天，见 `deploy/backup.sh`
+- 升级：`git pull → build → systemctl restart`，schema 随启动自动应用（IF NOT EXISTS）
+- 完整步骤：`deploy/README.md`
 - 监控：/healthz 探活 + 简单 uptime 告警（Uptime Kuma 或第三方）
 
 ## 8. 风险清单与缓解
