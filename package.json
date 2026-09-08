@@ -1,0 +1,16 @@
+{
+  "name": "edge-todo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal todo app: web PWA, Windows edge-dock client, Android with home-screen widget, cloud sync.",
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "dev:web": "pnpm --filter @edgetodo/web dev",
+    "dev:server": "pnpm --filter @edgetodo/server dev",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
